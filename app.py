@@ -22,12 +22,8 @@ from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_conn, db_path
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
@@ -49,13 +45,70 @@ st.set_page_config(page_title="HITL PR Review", layout="wide")
 st.title("HITL PR Review Agent")
 
 
+# ─── Data helpers ──────────────────────────────────────────────────────────
+async def fetch_recent_threads(limit: int = 15) -> list[dict]:
+    """Same query as `audit.replay.list_threads`, but returns rows instead of printing."""
+    async with db_conn() as conn:
+        async with conn.execute(
+            """
+            SELECT thread_id,
+                   pr_url,
+                   MAX(timestamp)  AS last_event,
+                   MAX(CASE risk_level WHEN 'high' THEN 3 WHEN 'med' THEN 2 ELSE 1 END) AS worst,
+                   COUNT(*)        AS events
+              FROM audit_events
+             GROUP BY thread_id, pr_url
+             ORDER BY MAX(timestamp) DESC
+             LIMIT ?
+            """,
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def load_thread(thread_id: str) -> dict:
+    """Read the checkpointed graph state of a thread (pending interrupt or final values)."""
+    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
+        await cp.setup()
+        app = build_graph(cp)
+        snap = await app.aget_state({"configurable": {"thread_id": thread_id}})
+    interrupts = [i for t in snap.tasks for i in t.interrupts]
+    return {
+        "values": snap.values,
+        "interrupt": interrupts[0].value if interrupts else None,
+    }
+
+
+def open_thread(thread_id: str) -> None:
+    """Jump back into an existing session (resume a pending interrupt or show its result)."""
+    loaded = asyncio.run(load_thread(thread_id))
+    st.session_state.thread_id = thread_id
+    st.session_state.pr_url = loaded["values"].get("pr_url", "")
+    st.session_state.interrupt_payload = loaded["interrupt"]
+    st.session_state.final = None if loaded["interrupt"] else loaded["values"]
+
+
 # ─── Sidebar — recent sessions ─────────────────────────────────────────────
+RISK_BADGE = {3: "🔴 high", 2: "🟡 med", 1: "🟢 low"}
+
 with st.sidebar:
     st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+    try:
+        threads = asyncio.run(fetch_recent_threads())
+    except Exception as e:  # e.g. DB locked / unreadable
+        threads = []
+        st.caption(f"Could not read audit_events: {e}")
+    if not threads:
+        st.caption("No sessions yet — run a review.")
+    for t in threads:
+        pr_short = t["pr_url"].split("github.com/")[-1]
+        label = f"{pr_short} · {RISK_BADGE.get(t['worst'], '?')} · {t['events']} ev"
+        current = t["thread_id"] == st.session_state.thread_id
+        if st.button(label, key=f"thread_{t['thread_id']}", type="primary" if current else "secondary",
+                     help=f"{t['thread_id']}\nlast event {t['last_event']}", width="stretch"):
+            open_thread(t["thread_id"])
+            st.rerun()
 
 
 # ─── Top form — start a new review ─────────────────────────────────────────
@@ -83,16 +136,15 @@ def render_approval_card(payload: dict) -> dict | None:
 
     feedback = st.text_input("Feedback (optional)", key="approval_feedback")
     col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
+    if col1.button("Approve", type="primary", width="stretch"):
+        return {"choice": "approve", "feedback": feedback}
+    if col2.button("Reject", width="stretch"):
+        return {"choice": "reject", "feedback": feedback}
+    if col3.button("Edit", width="stretch"):
+        if not feedback.strip():
+            st.warning("Write what should change in the feedback box before choosing Edit.")
+            return None
+        return {"choice": "edit", "feedback": feedback}
     return None
 
 
@@ -102,15 +154,18 @@ def render_escalation_card(payload: dict) -> dict | None:
     st.subheader(f"Strong escalation — confidence {conf:.0%}")
     st.caption(payload["confidence_reasoning"])
     if payload.get("risk_factors"):
-        st.error("Risks: " + ", ".join(payload["risk_factors"]))
+        st.error("**Risk factors**\n\n" + "\n".join(f"- {r}" for r in payload["risk_factors"]))
     st.markdown(payload["summary"])
 
     with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
         answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+        for i, q in enumerate(payload["questions"]):
+            answers[q] = st.text_area(q, key=f"esc_q_{i}", height=80)
+        if st.form_submit_button("Submit answers", type="primary"):
+            if any(not a.strip() for a in answers.values()):
+                st.warning("Please answer every question.")
+                return None
+            return {q: a.strip() for q, a in answers.items()}
     return None
 
 
@@ -119,18 +174,11 @@ async def run_graph(pr_url: str, thread_id: str, resume_value=None):
     """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
     async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
         await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
+        app = build_graph(cp)
         cfg = {"configurable": {"thread_id": thread_id}}
-
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+        if resume_value is None:
+            return await app.ainvoke({"pr_url": pr_url, "thread_id": thread_id}, cfg)
+        return await app.ainvoke(Command(resume=resume_value), cfg)
 
 
 # ─── Main flow ─────────────────────────────────────────────────────────────
@@ -140,13 +188,20 @@ if submitted and pr_url:
     st.session_state.interrupt_payload = None
     st.session_state.final = None
 
-    with st.spinner("Fetching PR + asking the LLM..."):
-        result = asyncio.run(run_graph(pr_url, st.session_state.thread_id))
+    try:
+        with st.spinner("Fetching PR + asking the LLM..."):
+            result = asyncio.run(run_graph(pr_url, st.session_state.thread_id))
+    except Exception as e:
+        st.error(f"Review failed: {e}")
+        st.stop()
 
     if "__interrupt__" in result:
         st.session_state.interrupt_payload = result["__interrupt__"][0].value
     else:
         st.session_state.final = result
+
+if st.session_state.thread_id:
+    st.caption(f"thread_id = `{st.session_state.thread_id}`")
 
 # Render the current interrupt card, if any
 payload = st.session_state.interrupt_payload
@@ -168,12 +223,33 @@ if payload is not None:
 # Render final state, if reached
 if st.session_state.final is not None:
     final = st.session_state.final
-    action = final.get("final_action", "?")
-    if action.startswith("auto") or action.startswith("committed"):
-        st.success(f"✓ {action} — comment posted to {st.session_state.pr_url}")
+    action = final.get("final_action") or "?"
+    analysis = final.get("analysis")
+    pr = st.session_state.pr_url
+
+    if action == "commit_failed" or action.endswith("commit_failed"):
+        st.error("Posting the comment to GitHub failed — check GITHUB_TOKEN scope.")
+    elif action.startswith("auto"):
+        st.success(f"✓ Auto-approved — agent posted the review itself ({action})")
+    elif action.startswith("committed"):
+        if final.get("escalation_answers"):
+            st.success("✓ Refined review posted after escalation")
+        else:
+            st.success("✓ Approved — review comment posted")
     elif action == "rejected":
-        st.warning("Rejected — no comment posted")
+        st.warning(f"Not posted (reviewer chose `{final.get('human_choice')}`)")
     else:
         st.info(f"final_action = {action}")
-    st.caption(f"thread_id = {st.session_state.thread_id}  ·  replay: "
-               f"`uv run python -m audit.replay --thread {st.session_state.thread_id}`")
+
+    if analysis is not None:
+        st.metric("Final confidence", f"{analysis.confidence:.0%}")
+        st.markdown(analysis.summary)
+        for c in analysis.comments:
+            st.markdown(f"- **[{c.severity}]** `{c.file}:{c.line or '?'}` — {c.body}")
+    if final.get("escalation_answers"):
+        with st.expander("Reviewer answers"):
+            for q, a in final["escalation_answers"].items():
+                st.markdown(f"**{q}**\n\n{a}")
+    if pr:
+        st.link_button("View comment on GitHub", pr)
+    st.caption(f"replay: `uv run python -m audit.replay --thread {st.session_state.thread_id}`")
